@@ -1,122 +1,175 @@
 # DevEvents
 
-# 1. Visão Geral
+Aplicação de eventos técnicos com **API REST** (Laravel) e **SPA** (React). O foco do backend é **regra de negócio e consistência**: autorização por papel, controle de ciclo de vida do evento e **contabilização de vagas** sob concorrência.
 
-**DevEvents** é uma plataforma de **eventos técnicos** com API REST (Laravel) e SPA (React). Dois perfis fixos:
+## 1. Visão geral
 
-- **Organizador** (`organizer`): cria e mantém apenas os seus eventos, consulta inscrições e pode cancelar eventos publicados.
-- **Participante** (`participant`): consulta o catálogo de eventos futuros publicados, vê detalhes, inscreve-se (com regras de vaga e duplicidade) e gerencia as próprias inscrições.
+Perfis fixos (papéis do usuário):
 
-O tráfego típico em Docker: browser → frontend **Nginx** (`:8080`) → requisições `/api/*` encaminhadas via proxy para o **Laravel** (`:8000`) → **PostgreSQL** (`:5432`). A API expõe a versão em **`/api/v1`**.
+- **Organizador** (`organizer`): mantém apenas os próprios eventos (CRUD), cancela eventos publicados e consulta inscrições do evento.
+- **Participante** (`participant`): navega catálogo público de eventos futuros, acessa detalhe de evento publicado, inscreve-se e gerencia as próprias inscrições.
+
+Topologia típica em Docker:
+
+- Browser → `frontend` (Nginx em `:8080`)
+- `frontend` → proxy `/api/*` → `backend` (Laravel em `:8000`)
+- `backend` → PostgreSQL (`:5432`)
+
+A API é versionada em **`/api/v1`**.
 
 ---
 
-# 2. Stack Tecnológica
+## 2. Stack
 
 | Camada | Tecnologia |
 |--------|------------|
-| **Backend** | Laravel **11**, PHP **^8.2** (requisito do projeto; imagem Docker atual **8.4**), **Laravel Sanctum** (tokens de API) |
+| **Backend** | Laravel **11**, PHP **^8.2** (requisito do projeto; imagem Docker atual **8.4**), **Laravel Sanctum** (tokens) |
 | **Frontend** | React **18**, TypeScript, **Vite 5**, React Router **6**, **Tailwind CSS 3** |
-| **Banco** | **PostgreSQL 16** (aplicação, testes automatizados e serviço no CI) |
-| **Infra** | **Docker Compose** (postgres + backend + frontend), **GitHub Actions** (`.github/workflows/ci.yml`) |
+| **Banco** | **PostgreSQL 16** |
+| **Infra/CI** | **Docker Compose**, **GitHub Actions** (`.github/workflows/ci.yml`) |
 
 ---
 
-# 3. Arquitetura e Decisões Técnicas
+## 3. Modelo de domínio (o que o sistema garante)
 
-Esta seção descreve apenas o que está no repositório.
+### Evento
 
-- **Camada HTTP**: rotas em `backend/routes/api.php`, agrupadas por prefixo `v1`, com `auth:sanctum` nas rotas protegidas e **rate limiting** (`throttle`) distinto para autenticação vs. resto da API.
-- **Validação**: `FormRequest` por operação (auth, organizador, participante), com regras explícitas e, onde aplicável, validação adicional pós-regras (ex.: consistência `ends_at` > `starts_at` na atualização de eventos).
-- **Autorização**:
-  - **Gates** globais `access-organizer-api` e `access-participant-api` (registrados no `AppServiceProvider`) aplicados por middleware `can:` nos grupos de rotas.
-  - **Policy** `EventPolicy` para operações sobre o modelo `Event` (visualização, atualização, cancelamento, listagem de inscrições do evento), usada a partir de `$this->authorize()` nos controllers e/ou `authorize()` nos `FormRequest` de escrita.
-- **Domínio e persistência**:
-  - **`EventRepository`**: consultas de listagem paginada (eventos do organizador autenticado; catálogo público futuro com filtros opcionais).
-  - **`EventRegistrationService`**: regras de inscrição e cancelamento com **`DB::transaction`**, **`lockForUpdate()`** em `events` e `event_registrations` e tratamento de violação de unicidade (concorrência / duplo submit).
-- **Recursos de API**: respostas JSON via **API Resources** (`EventResource`, `ParticipantEventResource`, `EventRegistrationResource`, etc.), alinhadas ao formato `data` / paginação do Laravel.
-- **PostgreSQL**:
-  - Coluna **`metadata`** em `events` como **`jsonb`** (nullable), com cast para array no modelo.
-  - **`timestamptz`** nas tabelas principais.
-  - **Constraints `CHECK`** em SQL para `status` de eventos e inscrições, regra `ends_at > starts_at` e `capacity > 0`.
-- **Notificações**: ao cancelar um evento publicado, é despachado um **Job** que notifica participantes com inscrição confirmada (detalhe na seção 9).
+- **Campos**: `title`, `description?`, `starts_at`, `ends_at`, `capacity`, `metadata? (jsonb)`
+- **Status**: controlado por `CHECK` constraint no banco (evita estados fora do contrato).
+- **Invariantes**:
+  - `ends_at > starts_at` (validado e reforçado via constraint).
+  - `capacity > 0` (constraint).
+
+### Inscrição
+
+- **Estados**: modelados com constraint (`CHECK`) para evitar status inválido.
+- O backend trata reativação de uma inscrição previamente cancelada (em vez de criar outra linha) para manter histórico/coerência de unicidade.
 
 ---
 
-# 4. Funcionalidades Principais
+## 4. Regras de negócio e contabilização de vagas (entradas/saídas)
 
-## Organizador
+O ponto “difícil” do backend é manter **vagas disponíveis** corretas quando há múltiplos requests concorrentes e duplo submit.
 
-- Cadastro com papel `organizer` (via API).
-- Listagem **paginada** apenas dos **próprios** eventos (com contagem de inscrições confirmadas e vagas restantes quando aplicável).
-- Criação de evento: título, descrição opcional, início, fim, capacidade, `metadata` opcional.
-- Leitura e atualização **apenas** de eventos próprios.
-- Cancelamento de evento próprio (`POST .../cancel`), com transição de estado para cancelado.
-- Listagem **paginada** de inscrições de um evento **próprio** (dados limitados do participante).
+### Fórmulas e derivação de dados
 
-## Participante
+- **Inscrições confirmadas**: \(confirmed\_count\) (contagem de registros confirmados por evento).
+- **Vagas restantes**: \(remaining = capacity - confirmed\_count\).
+
+Esses números aparecem na listagem do organizador e direcionam a regra de elegibilidade do participante.
+
+### Regras aplicadas ao inscrever/cancelar
+
+- Participante só se inscreve se o evento estiver **publicado**, **no futuro**, com **vaga** e sem duplicidade confirmada.
+- Cancelamento só é permitido para a **própria** inscrição.
+- Reativação: se já existe inscrição cancelada, a operação promove o status de volta para confirmado (mantém identidade e evita múltiplos registros “equivalentes”).
+
+### Concorrência (por que existe transação e lock)
+
+As operações de inscrição/cancelamento são encapsuladas no `EventRegistrationService` com:
+
+- `DB::transaction()` para atomicidade.
+- `lockForUpdate()` em `events` e `event_registrations` para serializar o “contador lógico” de vagas por evento.
+- Tratamento explícito de violação de unicidade (cenários de **duplo submit** e corrida entre requests).
+
+Resultado: o banco não aceita “oversell” de vagas e a API retorna erro de domínio consistente quando a regra não permite a transição.
+
+---
+
+## 5. Arquitetura e decisões de implementação
+
+Esta seção descreve decisões que aparecem no repositório (com o “porquê”).
+
+- **Camada HTTP**: rotas em `backend/routes/api.php`, agrupadas por `v1`. Rotas protegidas usam `auth:sanctum`. Existe `throttle` distinto para autenticação vs. resto da API para reduzir abuso sem penalizar navegação do catálogo.
+- **Validação**: `FormRequest` por operação para manter regras perto do boundary HTTP. Onde há invariantes de modelo (`ends_at > starts_at`), existe validação e reforço no banco (defesa em profundidade).
+- **Autorização por papel e por recurso**:
+  - Gates globais (`access-organizer-api`, `access-participant-api`) aplicados por middleware `can:` nos grupos de rotas.
+  - `EventPolicy` para decisões dependentes do recurso (`Event`) como update/cancel/listar inscrições do evento.
+- **Persistência orientada a caso de uso**:
+  - `EventRepository` concentra consultas de listagem paginada (eventos do organizador autenticado; catálogo futuro/publicado com filtros).
+  - `EventRegistrationService` concentra transições e invariantes de inscrição (inclui concorrência).
+- **Contrato de resposta**: API Resources (`EventResource`, `EventRegistrationResource`, etc.) padronizam `data` e paginação. Isso evita “acoplamento por shape” nos controllers e facilita evolução do payload.
+- **PostgreSQL como guardião de invariantes**:
+  - `metadata` em `events` como `jsonb` (nullable) para extensões sem migração a cada novo campo.
+  - `timestamptz` para evitar ambiguidade de timezone no domínio de agenda.
+  - `CHECK` constraints para status e regras críticas (datas/capacidade), reduzindo dependência de validação apenas na camada PHP.
+- **Cancelamento com side effects controlado**: ao cancelar evento publicado, o backend despacha um job de notificação para participantes confirmados (detalhes na seção 9).
+
+---
+
+## 6. Funcionalidades
+
+### Organizador
+
+- Cadastro com papel `organizer`.
+- Listagem paginada dos próprios eventos, com contagens derivadas (confirmadas / vagas restantes).
+- CRUD de evento (escopo do próprio organizador).
+- Cancelamento (`POST .../cancel`) com transição de estado.
+- Listagem paginada de inscrições de um evento próprio (payload reduzido do participante).
+
+### Participante
 
 - Cadastro com papel `participant`.
-- Listagem **paginada** de eventos **futuros** e **publicados** (catálogo), com filtros opcionais (`q`, `organizer_id`, `starts_from`, `starts_until`) expostos na API.
-- Detalhe de evento **publicado** (a API não restringe o detalhe a “futuros”; o catálogo sim).
-- Inscrição num evento elegível (publicado, futuro, com vaga, sem inscrição confirmada duplicada; reativação de registro previamente cancelado é tratada no serviço).
-- Cancelamento da **própria** inscrição.
-- Listagem **paginada** das **próprias** inscrições (“meus eventos” / `my-events`).
+- Catálogo paginado de eventos futuros e publicados, com filtros (`q`, `organizer_id`, `starts_from`, `starts_until`).
+- Detalhe de evento publicado (o detalhe não é restrito a “futuros”; o catálogo é).
+- Inscrição com aplicação de regras (vaga/duplicidade/reativação).
+- Cancelamento da própria inscrição.
+- Listagem paginada das próprias inscrições (`my-events`).
 
 ---
 
-# 5. Execução do Projeto
+## 7. Execução
 
-## Rodando com Docker
+### Docker
 
 **Pré-requisitos:** Docker Engine 24+ e Docker Compose v2.
 
-Na **raiz** do repositório:
+Na raiz do repositório:
 
-1. **Variáveis de ambiente do Compose** (opcional mas recomendado): copie o exemplo da raiz.
+1) Variáveis do Compose (recomendado):
 
-   ```bash
-   cp .env.example .env
-   ```
+```bash
+cp .env.example .env
+```
 
-   No Windows (PowerShell): `Copy-Item .env.example .env`
+No Windows (PowerShell): `Copy-Item .env.example .env`
 
-2. **Subir os serviços** (build na primeira vez):
+2) Subir serviços:
 
-   ```bash
-   docker compose up -d --build
-   ```
+```bash
+docker compose up -d --build
+```
 
-3. **Esquema do banco de dados**: por padrão o `entrypoint` do backend **não** roda migrações automaticamente. É necessário migrar **uma vez** (ou sempre que o esquema mudar), por exemplo:
+3) Migrar schema (o `entrypoint` não roda migrações por padrão):
 
-   ```bash
-   docker compose exec backend php artisan migrate --force
-   ```
+```bash
+docker compose exec backend php artisan migrate --force
+```
 
-   Comportamento **opcional** já suportado pelo **container**: se existir a variável de ambiente **`RUN_MIGRATIONS_ON_BOOT=true`**, o `entrypoint` executa `php artisan migrate --force` na inicialização (útil em alguns ambientes de deploy; ver comentários em `backend/docker/entrypoint.sh`).
+Opcional: `RUN_MIGRATIONS_ON_BOOT=true` faz o container executar `php artisan migrate --force` na inicialização (ver `backend/docker/entrypoint.sh`).
 
-4. **Dados de demonstração** (opcional):
+4) Seed (opcional):
 
-   ```bash
-   docker compose exec backend php artisan db:seed --force
-   ```
+```bash
+docker compose exec backend php artisan db:seed --force
+```
 
-5. **URLs** (portas padrão do `docker-compose.yml`):
+5) URLs:
 
-   - Frontend: `http://localhost:8080`
-   - Backend (API): `http://localhost:8000`
-   - PostgreSQL no host: `localhost:5432`
+- Frontend: `http://localhost:8080`
+- Backend (API): `http://localhost:8000`
+- PostgreSQL no host: `localhost:5432`
 
-6. **Credenciais de seed** (após `DevEventsSeeder`; senha comum: `password`):
+6) Credenciais do seed (senha: `password`):
 
-   - `organizer1@devevents.test`
-   - `participant1@devevents.test`
+- `organizer1@devevents.test`
+- `participant1@devevents.test`
 
-O frontend, em Docker, envia requisições para **`/api/v1`** no mesmo host; o **Nginx** do serviço `frontend` encaminha `/api` para o serviço `backend` (ver `frontend/nginx.conf`).
+Em Docker, o frontend chama **`/api/v1`** no mesmo host; o Nginx (`frontend/nginx.conf`) encaminha `/api` para o serviço `backend`.
 
-## Rodando localmente (sem Docker)
+### Local (sem Docker)
 
-### Backend
+Backend:
 
 ```bash
 cd backend
@@ -128,9 +181,7 @@ php artisan db:seed --force
 php artisan serve --host=127.0.0.1 --port=8000
 ```
 
-Ajuste `DB_*` em `backend/.env` para o seu PostgreSQL. No Windows (PowerShell): `Copy-Item .env.example .env`
-
-### Frontend
+Frontend:
 
 ```bash
 cd frontend
@@ -139,81 +190,86 @@ cp .env.example .env
 npm run dev
 ```
 
-O Vite (`frontend/vite.config.ts`) define **proxy** de `/api` para `http://localhost:8000`, coerente com `VITE_API_BASE_URL=/api/v1` em `frontend/.env.example`.
+O Vite (`frontend/vite.config.ts`) faz proxy de `/api` para `http://localhost:8000`, coerente com `VITE_API_BASE_URL=/api/v1` em `frontend/.env.example`.
 
 ---
 
-# 6. Autenticação
+## 8. Autenticação
 
-- **Sanctum** com **Personal Access Tokens** (`personal_access_tokens`). O cadastro e o login devolvem o usuário em `data` e o token em `meta.token` (ver `AuthController` e `UserResource`).
-- O cliente React (`frontend/src/shared/api/client.ts`) envia **`Authorization: Bearer <token>`** em requisições autenticadas.
-- O token é guardado em **`localStorage`** (chave interna do projeto; ver o mesmo arquivo). Em aplicações reais costuma haver discussão sobre `localStorage` vs. cookies `httpOnly`; aqui o desenho é explícito e simples para uma SPA com API em domínio/porta diferentes conforme ambiente.
+- Sanctum com **Personal Access Tokens** (`personal_access_tokens`).
+- Cadastro/login retornam usuário em `data` e token em `meta.token` (ver `AuthController` e `UserResource`).
+- O cliente React (`frontend/src/shared/api/client.ts`) envia `Authorization: Bearer <token>`.
+- O token fica em `localStorage`. A decisão foi manter uma SPA simples; alternativas (cookies `httpOnly` + CSRF) mudam o desenho e não são o objetivo aqui.
 
 ---
 
-# 7. Testes
+## 9. Testes
 
-**Comando** (na pasta `backend`, com dependências instaladas):
+Rodar (na pasta `backend`):
 
 ```bash
 composer install
 php artisan test
 ```
 
-**O que está coberto**
+Cobertura atual:
 
-- **Testes de API** (`tests/Feature/Api/V1/`): autenticação, organizador (CRUD de eventos, autorização entre organizadores, cancelamento com notificação falsa), participante (catálogo, detalhe, inscrições, regras de negócio, isolamento por papel).
-- **Testes unitários** do serviço de inscrições (`tests/Unit/EventRegistrationServiceTest.php`).
+- **Feature tests da API** (`tests/Feature/Api/V1/`): auth, organizador (CRUD, autorização entre organizadores, cancelamento + notificação fake), participante (catálogo, detalhe, inscrições e regras de negócio).
+- **Unit tests** do `EventRegistrationService` (`tests/Unit/EventRegistrationServiceTest.php`), focando invariantes e cenários de concorrência/duplicidade.
 
-**O que não está coberto por esta suíte**
+Não coberto:
 
-- **Sem testes automatizados no frontend** (não há script `test` em `frontend/package.json` além de `lint` e `build`).
+- Frontend sem suíte de testes (há `lint` e `build`).
 
-Foi versionado um exemplo de saída de testes em `docs/test-run-sample.txt` (o conteúdo pode ficar desatualizado em relação ao número exato de testes; a fonte da verdade é sempre `php artisan test`).
-
----
-
-# 8. API e Postman
-
-- **Coleção:** `docs/postman/DevEvents.postman_collection.json`
-- **Variáveis da coleção:** `baseUrl` (ex.: `http://localhost:8000/api/v1` com a API direta, ou `http://localhost:8080/api/v1` através do proxy do frontend em Docker) e `token` (preencher após login/cadastro a partir de `meta.token`).
+Existe um exemplo de saída em `docs/test-run-sample.txt` (pode divergir do estado atual; a fonte de verdade é `php artisan test`).
 
 ---
 
-# 9. Filas e Notificações
+## 10. API e Postman
 
-- Existe o job **`NotifyRegisteredParticipantsEventCancelled`**, despachado quando um evento **publicado** é cancelado, que percorre inscrições confirmadas e envia **`EventCancelledNotification`** por canal `mail`.
-- Tanto o job quanto a notificação implementam **`ShouldQueue`**; o comportamento efetivo depende da configuração de filas do ambiente.
-- Nos **testes**, `backend/phpunit.xml` define explicitamente **`QUEUE_CONNECTION=sync`**, o que força a fila em modo **síncrono** (processamento imediato, sem worker separado) durante a suíte.
-- O **`docker-compose.yml` atual não inclui** um processo dedicado tipo `queue:work`; em desenvolvimento Docker típico, **`sync`** (ou ausência de worker) implica que filas assíncronas reais **não** seriam consumidas automaticamente — o importante é saber **qual** `QUEUE_CONNECTION` está ativo no `.env` do backend em cada ambiente.
+- Coleção: `docs/postman/DevEvents.postman_collection.json`
+- Variáveis:
+  - `baseUrl`: `http://localhost:8000/api/v1` (API direta) ou `http://localhost:8080/api/v1` (via proxy do frontend em Docker)
+  - `token`: preencher após login/cadastro com `meta.token`
 
 ---
 
-# 10. CI/CD
+## 11. Filas e notificações
+
+- Job `NotifyRegisteredParticipantsEventCancelled` é despachado quando um evento **publicado** é cancelado e envia `EventCancelledNotification` via `mail`.
+- Job e notificação implementam `ShouldQueue`; o efeito depende do `QUEUE_CONNECTION`.
+- Nos testes, `backend/phpunit.xml` define `QUEUE_CONNECTION=sync` para processamento imediato.
+- O `docker-compose.yml` não inclui `queue:work`; para fila realmente assíncrona em Docker, é necessário um worker dedicado.
+
+---
+
+## 12. CI
 
 Arquivo: `.github/workflows/ci.yml`.
 
-- **Job `backend`:** checkout, PHP 8.2, extensões `pgsql`, `composer install`, serviço PostgreSQL 16, `php artisan test`.
-- **Job `frontend`:** checkout, Node 20, cache npm, `npm ci`, `npm run build`.
+- `backend`: PHP 8.2 + `pgsql`, PostgreSQL 16 como service, `php artisan test`.
+- `frontend`: Node 20, `npm ci`, `npm run build`.
 
-Não há pipeline de deploy para produção neste arquivo — apenas verificação de build e testes.
-
----
-
-# 11. Limitações Conhecidas
-
-- **Sem testes automatizados no frontend** (apenas lint e build no `package.json` / CI).
-- **Filas / e-mail**: notificação de cancelamento depende de configuração de mail (`MAIL_*`) e de fila; o Compose local não inclui worker de fila dedicado.
-- **Mensagens de erro de domínio** em parte da API (ex.: regras de inscrição no serviço) estão em **inglês**, enquanto outras mensagens (ex.: `lang/pt_BR/auth.php`) estão em **português** — inconsistência de idioma na superfície HTTP.
-- **README / `.env`**: existem dois níveis de exemplo (`.env.example` na raiz para Compose; `backend/.env.example` para execução direta do Laravel); `APP_URL` e `SANCTUM_STATEFUL_DOMAINS` diferem conforme o cenário (SPA na porta 5173 vs. 8080 vs. API na 8000).
+Não há deploy automatizado — o pipeline é de build/test.
 
 ---
 
-# 12. Possíveis Melhorias
+## 13. Limitações conhecidas
 
-- Unificar **idioma** das mensagens de validação e de negócio expostas na API (ou documentar contrato bilíngue de propósito).
-- Acrescentar **testes de UI ou contrato** mínimos no frontend, se o critério de avaliação o valorizar.
-- Documentar no próprio repositório a **estratégia de filas** pretendida para demo vs. produção (uma linha no `.env.example` do backend pode bastar).
+- Frontend sem testes automatizados.
+- Notificação por e-mail/filas depende de `MAIL_*` e de worker quando `QUEUE_CONNECTION` não é `sync`.
+- Mensagens de erro misturam português/inglês (contrato HTTP não está unificado).
+- Dois níveis de `.env.example` (raiz para Compose; `backend/.env.example` para execução direta). `APP_URL` e `SANCTUM_STATEFUL_DOMAINS` mudam conforme portas (5173/8080/8000).
+
+---
+
+## 14. Possíveis melhorias / roadmap
+
+- Unificar idioma e padronizar **códigos de erro de domínio** (ex.: `EVENT_FULL`, `ALREADY_REGISTERED`) para facilitar UX e integrações.
+- Adicionar testes no frontend (contrato ou smoke) cobrindo fluxo de login, catálogo e inscrição/cancelamento.
+- Introduzir **idempotency key** na inscrição para reduzir retrabalho em retries do cliente (além do tratamento atual de corrida).
+- Adicionar um serviço de worker no Compose para cenários com `QUEUE_CONNECTION=redis|database`.
+- Evoluir “contabilização” de vagas para relatórios (ex.: séries temporais de ocupação) sem sobrecarregar endpoints transacionais.
 
 ---
 
