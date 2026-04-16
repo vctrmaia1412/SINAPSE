@@ -1,0 +1,31 @@
+Comando executado:
+`php artisan test`
+
+Saída:
+
+   PASS  Tests\Unit\EventRegistrationServiceTest
+  ✓ register throws when event already started
+  ✓ register throws when already confirmed
+  ✓ register succeeds when spots available
+
+   PASS  Tests\Feature\Api\V1\AuthApiTest
+  ✓ register creates organizer
+  ✓ register creates participant
+  ✓ login succeeds with valid credentials
+  ✓ login fails with invalid credentials
+  ✓ logout revokes only current token
+  ✓ me returns authenticated user
+  ✓ me without token returns unauthorized
+
+   PASS  Tests\Feature\Api\V1\OrganizerEventApiTest
+  ✓ organizer can list own events
+  ✓ organizer can create event
+  ✓ organizer can update own event
+  ✓ organizer can cancel own event
+
+   PASS  Tests\Feature\Api\V1\ParticipantRegistrationApiTest
+  ✓ participant can list published events
+  ✓ participant can register in event
+  ✓ participant can cancel registration
+
+  Tests: 38 passed
